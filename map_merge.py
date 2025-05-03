@@ -18,6 +18,7 @@ import os
 import glob
 import traceback
 import datetime
+from skimage.feature import local_binary_pattern
 
 def load_map(file_path: str) -> np.ndarray:
     """
@@ -40,7 +41,7 @@ def load_map(file_path: str) -> np.ndarray:
 
 def enhance_image(img: np.ndarray) -> np.ndarray:
     """
-    增强图像以提高特征检测质量
+    增强图像以提高特征检测质量，特别针对红外探测的低清晰度地图
     
     参数:
         img: 输入图像
@@ -48,14 +49,88 @@ def enhance_image(img: np.ndarray) -> np.ndarray:
     返回:
         增强后的图像
     """
-    # 应用CLAHE（对比度受限的自适应直方图均衡化）
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(img)
+    # 检查图像是否为空
+    if img is None or img.size == 0:
+        print("  - 警告: 输入图像为空")
+        return np.zeros((10, 10), dtype=np.uint8)  # 返回小型空图像
     
-    # 应用高斯模糊去除噪声
-    enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+    # 确保图像类型正确
+    if img.dtype != np.uint8:
+        img = img.astype(np.uint8)
     
-    return enhanced
+    # 1. 去噪处理
+    # 使用非局部均值去噪，保留更多细节
+    denoised = cv2.fastNlMeansDenoising(img, None, h=10, searchWindowSize=21, templateWindowSize=7)
+    
+    # 2. 应用CLAHE（对比度受限的自适应直方图均衡化）- 参数增强
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(denoised)
+    
+    # 3. 边缘保持滤波
+    # 使用双边滤波保留边缘同时平滑区域
+    bilateral = cv2.bilateralFilter(enhanced, d=9, sigmaColor=75, sigmaSpace=75)
+    
+    # 4. 锐化处理增强结构
+    kernel_sharpen = np.array([[-1,-1,-1],
+                              [-1, 9,-1],
+                              [-1,-1,-1]])
+    sharpen = cv2.filter2D(bilateral, -1, kernel_sharpen)
+    
+    # 5. 形态学操作增强结构
+    kernel = np.ones((3, 3), np.uint8)
+    # 使用形态学闭操作填充小孔
+    morph = cv2.morphologyEx(sharpen, cv2.MORPH_CLOSE, kernel)
+    
+    # 6. 进一步增强对比度
+    # 通过阈值处理使结构更加明显
+    _, thresholded = cv2.threshold(morph, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
+    # 7. 混合原始增强图像和阈值化图像，保留更多细节
+    alpha = 0.7
+    beta = 0.3
+    blended = cv2.addWeighted(morph, alpha, thresholded, beta, 0)
+    
+    # 8. 最终使用轻度高斯模糊降低噪声
+    final = cv2.GaussianBlur(blended, (3, 3), 0)
+    
+    return final
+
+def enhance_structure(img: np.ndarray) -> np.ndarray:
+    """
+    专门增强图像中的结构特征，适用于红外地图
+    
+    参数:
+        img: 输入图像
+        
+    返回:
+        结构增强后的图像
+    """
+    # 基础增强
+    enhanced = enhance_image(img)
+    
+    # 提取结构边缘
+    edges = cv2.Canny(enhanced, 30, 150)
+    
+    # 膨胀边缘使结构更明显
+    kernel = np.ones((3, 3), np.uint8)
+    dilated_edges = cv2.dilate(edges, kernel, iterations=1)
+    
+    # 腐蚀操作去除小噪点
+    eroded = cv2.erode(dilated_edges, kernel, iterations=1)
+    
+    # 将边缘叠加到原始增强图像上
+    result = cv2.addWeighted(enhanced, 0.7, eroded, 0.3, 0)
+    
+    # 应用自适应阈值进一步增强局部对比度
+    adaptive_thresh = cv2.adaptiveThreshold(
+        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY, 11, 2
+    )
+    
+    # 最终混合
+    final = cv2.addWeighted(result, 0.6, adaptive_thresh, 0.4, 0)
+    
+    return final
 
 def detect_features(img: np.ndarray) -> Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]:
     """
@@ -493,7 +568,7 @@ def visualize_matches(img1: np.ndarray, kp1: List[cv2.KeyPoint],
 
 def extract_multi_level_features(img: np.ndarray) -> dict:
     """
-    提取图像的多层次特征
+    提取图像的多层次特征，特别针对结构增强
     
     参数:
         img: 输入图像
@@ -503,43 +578,67 @@ def extract_multi_level_features(img: np.ndarray) -> dict:
     """
     features = {}
     
-    # 图像增强
+    # 基础图像增强
     enhanced_img = enhance_image(img)
     
-    # 1. 原始ORB特征
+    # 结构增强处理
+    structure_img = enhance_structure(img)
+    
+    # 1. 原始ORB特征 - 使用结构增强后的图像
     orb = cv2.ORB_create(
-        nfeatures=3000,
-        scaleFactor=1.2,
-        nlevels=8,
-        edgeThreshold=31,
+        nfeatures=5000,        # 增加特征点数量
+        scaleFactor=1.1,       # 减小金字塔层级间的比例因子，检测更多尺度
+        nlevels=10,            # 增加金字塔层级数
+        edgeThreshold=31,      # 边缘阈值
         firstLevel=0,
-        WTA_K=2,
-        patchSize=31
+        WTA_K=3,               # 增加用于计算BRIEF描述子的点数
+        patchSize=31,          # 特征点附近的区域大小
+        fastThreshold=20       # 降低FAST检测器阈值，检测更多角点
     )
-    kp_orb, desc_orb = orb.detectAndCompute(enhanced_img, None)
+    
+    # 在结构增强图像上检测特征
+    kp_orb, desc_orb = orb.detectAndCompute(structure_img, None)
     features['orb'] = (kp_orb, desc_orb)
     
-    # 2. 边缘特征
-    edges = cv2.Canny(enhanced_img, 50, 150)
+    # 2. 边缘特征 - 使用更敏感的参数
+    edges = cv2.Canny(enhanced_img, 30, 150)
     # 对边缘进行膨胀以增强特征点检测
     kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
+    edges = cv2.dilate(edges, kernel, iterations=2)  # 增加膨胀迭代次数
+    
+    # 在边缘图像上检测特征
     kp_edge, desc_edge = orb.detectAndCompute(edges, None)
     features['edge'] = (kp_edge, desc_edge)
     
     # 3. 形态学处理后的特征
     # 闭运算填充小孔
-    morph_img = cv2.morphologyEx(enhanced_img, cv2.MORPH_CLOSE, kernel)
+    morph_img = cv2.morphologyEx(structure_img, cv2.MORPH_CLOSE, kernel, iterations=2)
     # 开运算去除小物体
     morph_img = cv2.morphologyEx(morph_img, cv2.MORPH_OPEN, kernel)
+    
+    # 在形态学处理图像上检测特征
     kp_morph, desc_morph = orb.detectAndCompute(morph_img, None)
     features['morph'] = (kp_morph, desc_morph)
+    
+    # 4. 新增：LBP纹理特征
+    # 计算LBP (Local Binary Patterns)纹理特征
+    radius = 3
+    n_points = 8 * radius
+    
+    try:
+        lbp = local_binary_pattern(enhanced_img, n_points, radius, method='uniform')
+        lbp = (lbp * 255.0 / lbp.max()).astype(np.uint8)
+        kp_lbp, desc_lbp = orb.detectAndCompute(lbp, None)
+        features['lbp'] = (kp_lbp, desc_lbp)
+    except Exception as e:
+        print(f"  - LBP特征提取失败: {e}")
+        features['lbp'] = ([], None)
     
     return features
 
 def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple[Optional[np.ndarray], List[cv2.KeyPoint], List[cv2.KeyPoint], List[cv2.DMatch], str, Optional[List[cv2.DMatch]], Optional[np.ndarray]]:
     """
-    使用多层次特征进行匹配
+    使用多层次特征进行匹配，优先使用结构增强特征
     
     参数:
         img1: 第一张图像
@@ -552,10 +651,37 @@ def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple
     features1 = extract_multi_level_features(img1)
     features2 = extract_multi_level_features(img2)
     
-    # 特征类型优先级
-    feature_types = ['orb', 'edge', 'morph']
+    # 特征类型优先级，包括新增的LBP特征
+    feature_types = ['orb', 'edge', 'morph', 'lbp']
     
+    # 强制ORB匹配尝试
+    kp1, desc1 = features1['orb']
+    kp2, desc2 = features2['orb']
+    
+    if desc1 is not None and desc2 is not None and len(kp1) >= 4 and len(kp2) >= 4:
+        print(f"  - 尝试使用增强ORB特征强制匹配")
+        print(f"  - 增强ORB特征点数量: {len(kp1)}/{len(kp2)}")
+        
+        # 使用超宽松匹配
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        matches = matcher.match(desc1, desc2)
+        matches = sorted(matches, key=lambda x: x.distance)[:int(len(matches) * 0.6)]  # 只保留60%的最佳匹配
+        
+        print(f"  - 强制匹配后点数: {len(matches)}")
+        
+        # 尝试计算变换矩阵
+        if len(matches) >= 4:
+            H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.9)
+            
+            if H is not None:
+                print(f"  - 使用增强ORB特征强制找到变换矩阵")
+                return H, kp1, kp2, matches, 'orb_enhanced', filtered_matches, inliers
+    
+    # 尝试所有特征类型
     for feature_type in feature_types:
+        if feature_type not in features1 or feature_type not in features2:
+            continue
+            
         kp1, desc1 = features1[feature_type]
         kp2, desc2 = features2[feature_type]
         
@@ -573,17 +699,21 @@ def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple
         # 如果匹配点太少，尝试更宽松的匹配
         if len(matches) < 10:
             print(f"  - 标准匹配点不足({len(matches)}个)，尝试宽松匹配")
-            matches = relaxed_match_features(desc1, desc2)
+            matches = relaxed_match_features(desc1, desc2, ratio=0.9)
             print(f"  - 宽松匹配后点数: {len(matches)}")
+            
+            # 如果仍然不足，尝试直接匹配
+            if len(matches) < 8:
+                print(f"  - 宽松匹配点仍不足，尝试直接匹配")
+                matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+                matches = matcher.match(desc1, desc2)
+                matches = sorted(matches, key=lambda x: x.distance)[:min(50, len(matches))]
+                print(f"  - 直接匹配后点数: {len(matches)}")
         
         # 如果匹配足够，计算变换矩阵
         if len(matches) >= 4:
-            # 对于不同特征类型使用不同的参数
-            if feature_type == 'orb':
-                H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.8)
-            else:
-                # 对其他特征类型使用更宽松的参数
-                H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.9)
+            # 所有特征类型使用宽松参数
+            H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.9)
                 
             if H is not None:
                 print(f"  - 使用{feature_type}特征找到变换矩阵")
@@ -592,7 +722,7 @@ def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple
     print("  - 所有特征类型都未能找到有效变换矩阵")
     return None, None, None, None, None, None, None
 
-def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 0.8) -> List[cv2.DMatch]:
+def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 0.9) -> List[cv2.DMatch]:
     """
     使用更宽松的参数进行特征匹配
     
@@ -615,6 +745,7 @@ def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 
     for matches in raw_matches:
         # 有时候只能找到一个匹配
         if len(matches) < 2:
+            good_matches.append(matches[0])  # 直接添加唯一匹配
             continue
             
         m, n = matches
