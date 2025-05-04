@@ -346,7 +346,7 @@ def filter_matches_by_geometry(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
 def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint], 
                              matches: List[cv2.DMatch], ratio: float = 0.8) -> Tuple[Optional[np.ndarray], Optional[List[cv2.DMatch]], Optional[np.ndarray]]:
     """
-    计算两个图像之间的刚性变换矩阵（仅旋转和平移）
+    计算两个图像之间的刚性变换矩阵（仅旋转和平移，不进行缩放）
     
     参数:
         kp1: 第一张图像的关键点
@@ -381,6 +381,8 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches])
         
         # 使用RANSAC计算刚性变换矩阵（旋转+平移）
+        # 注意：我们不能使用scale=False参数，因为你的OpenCV版本不支持
+        # 使用原始的estimateAffinePartial2D，然后手动修正矩阵来禁用缩放
         partial_affine, inliers = cv2.estimateAffinePartial2D(
             src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
         )
@@ -388,14 +390,42 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
         if partial_affine is None or inliers is None:
             print("  - 无法计算刚性变换矩阵")
             return None, None, None
-            
+        
+        # 手动处理矩阵以确保没有缩放
+        # 提取仿射变换中的旋转部分并强制其为正交矩阵
+        a, b = partial_affine[0, 0], partial_affine[0, 1]
+        c, d = partial_affine[1, 0], partial_affine[1, 1]
+        
+        # 计算缩放因子（忽略，我们将强制为1）
+        # scale = np.sqrt(a*a + b*b)
+        
+        # 计算旋转角度
+        angle = np.arctan2(b, a)
+        
+        # 重建仅包含旋转的矩阵（缩放因子=1）
+        cos_theta = np.cos(angle)
+        sin_theta = np.sin(angle)
+        
+        # 创建纯旋转矩阵（缩放=1）
+        rotation_matrix = np.array([
+            [cos_theta, sin_theta],
+            [-sin_theta, cos_theta]
+        ])
+        
+        # 复制原始平移部分
+        translation = partial_affine[:, 2].reshape(2, 1)
+        
+        # 重建仅含旋转和平移的仿射矩阵
+        corrected_affine = np.hstack((rotation_matrix, translation))
+        
         # 将2x3仿射矩阵转换为3x3的变换矩阵
         H = np.eye(3, dtype=np.float32)
-        H[:2, :] = partial_affine
+        H[:2, :] = corrected_affine
             
         # 计算内点比例
         inlier_ratio = np.sum(inliers) / len(inliers)
         print(f"  - RANSAC内点比例: {inlier_ratio:.2f}")
+        print(f"  - 已强制消除缩放，只保留旋转和平移")
         
         # 如果内点比例太低，可能是错误匹配
         if inlier_ratio < 0.3:
@@ -407,12 +437,25 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
             if partial_affine is None or inliers is None:
                 print("  - 重新计算失败")
                 return None, None, None
-                
+            
+            # 再次应用相同的纠正   
+            a, b = partial_affine[0, 0], partial_affine[0, 1]
+            angle = np.arctan2(b, a)
+            cos_theta = np.cos(angle)
+            sin_theta = np.sin(angle)
+            rotation_matrix = np.array([
+                [cos_theta, sin_theta],
+                [-sin_theta, cos_theta]
+            ])
+            translation = partial_affine[:, 2].reshape(2, 1)
+            corrected_affine = np.hstack((rotation_matrix, translation))
+            
             H = np.eye(3, dtype=np.float32)
-            H[:2, :] = partial_affine
+            H[:2, :] = corrected_affine
             
             inlier_ratio = np.sum(inliers) / len(inliers)
             print(f"  - 重新计算后的内点比例: {inlier_ratio:.2f}")
+            print(f"  - 已强制消除缩放，只保留旋转和平移")
             
             if inlier_ratio < 0.2:
                 print("  - 内点比例仍然过低，拒绝变换")
