@@ -18,7 +18,6 @@ import os
 import glob
 import traceback
 import datetime
-from skimage.feature import local_binary_pattern
 
 def load_map(file_path: str) -> np.ndarray:
     """
@@ -41,7 +40,7 @@ def load_map(file_path: str) -> np.ndarray:
 
 def enhance_image(img: np.ndarray) -> np.ndarray:
     """
-    增强图像以提高特征检测质量，特别针对红外探测的低清晰度地图
+    增强图像以提高特征检测质量
     
     参数:
         img: 输入图像
@@ -49,88 +48,14 @@ def enhance_image(img: np.ndarray) -> np.ndarray:
     返回:
         增强后的图像
     """
-    # 检查图像是否为空
-    if img is None or img.size == 0:
-        print("  - 警告: 输入图像为空")
-        return np.zeros((10, 10), dtype=np.uint8)  # 返回小型空图像
+    # 应用CLAHE（对比度受限的自适应直方图均衡化）
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(img)
     
-    # 确保图像类型正确
-    if img.dtype != np.uint8:
-        img = img.astype(np.uint8)
+    # 应用高斯模糊去除噪声
+    enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
     
-    # 1. 去噪处理
-    # 使用非局部均值去噪，保留更多细节
-    denoised = cv2.fastNlMeansDenoising(img, None, h=10, searchWindowSize=21, templateWindowSize=7)
-    
-    # 2. 应用CLAHE（对比度受限的自适应直方图均衡化）- 参数增强
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(denoised)
-    
-    # 3. 边缘保持滤波
-    # 使用双边滤波保留边缘同时平滑区域
-    bilateral = cv2.bilateralFilter(enhanced, d=9, sigmaColor=75, sigmaSpace=75)
-    
-    # 4. 锐化处理增强结构
-    kernel_sharpen = np.array([[-1,-1,-1],
-                              [-1, 9,-1],
-                              [-1,-1,-1]])
-    sharpen = cv2.filter2D(bilateral, -1, kernel_sharpen)
-    
-    # 5. 形态学操作增强结构
-    kernel = np.ones((3, 3), np.uint8)
-    # 使用形态学闭操作填充小孔
-    morph = cv2.morphologyEx(sharpen, cv2.MORPH_CLOSE, kernel)
-    
-    # 6. 进一步增强对比度
-    # 通过阈值处理使结构更加明显
-    _, thresholded = cv2.threshold(morph, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # 7. 混合原始增强图像和阈值化图像，保留更多细节
-    alpha = 0.7
-    beta = 0.3
-    blended = cv2.addWeighted(morph, alpha, thresholded, beta, 0)
-    
-    # 8. 最终使用轻度高斯模糊降低噪声
-    final = cv2.GaussianBlur(blended, (3, 3), 0)
-    
-    return final
-
-def enhance_structure(img: np.ndarray) -> np.ndarray:
-    """
-    专门增强图像中的结构特征，适用于红外地图
-    
-    参数:
-        img: 输入图像
-        
-    返回:
-        结构增强后的图像
-    """
-    # 基础增强
-    enhanced = enhance_image(img)
-    
-    # 提取结构边缘
-    edges = cv2.Canny(enhanced, 30, 150)
-    
-    # 膨胀边缘使结构更明显
-    kernel = np.ones((3, 3), np.uint8)
-    dilated_edges = cv2.dilate(edges, kernel, iterations=1)
-    
-    # 腐蚀操作去除小噪点
-    eroded = cv2.erode(dilated_edges, kernel, iterations=1)
-    
-    # 将边缘叠加到原始增强图像上
-    result = cv2.addWeighted(enhanced, 0.7, eroded, 0.3, 0)
-    
-    # 应用自适应阈值进一步增强局部对比度
-    adaptive_thresh = cv2.adaptiveThreshold(
-        enhanced, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-        cv2.THRESH_BINARY, 11, 2
-    )
-    
-    # 最终混合
-    final = cv2.addWeighted(result, 0.6, adaptive_thresh, 0.4, 0)
-    
-    return final
+    return enhanced
 
 def detect_features(img: np.ndarray) -> Tuple[List[cv2.KeyPoint], Optional[np.ndarray]]:
     """
@@ -346,7 +271,7 @@ def filter_matches_by_geometry(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
 def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint], 
                              matches: List[cv2.DMatch], ratio: float = 0.8) -> Tuple[Optional[np.ndarray], Optional[List[cv2.DMatch]], Optional[np.ndarray]]:
     """
-    计算两个图像之间的刚性变换矩阵（仅旋转和平移，不进行缩放）
+    计算两个图像之间的刚性变换矩阵（仅旋转和平移）
     
     参数:
         kp1: 第一张图像的关键点
@@ -381,8 +306,6 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
         dst_pts = np.float32([kp2[m.trainIdx].pt for m in good_matches])
         
         # 使用RANSAC计算刚性变换矩阵（旋转+平移）
-        # 注意：我们不能使用scale=False参数，因为你的OpenCV版本不支持
-        # 使用原始的estimateAffinePartial2D，然后手动修正矩阵来禁用缩放
         partial_affine, inliers = cv2.estimateAffinePartial2D(
             src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=3.0
         )
@@ -390,42 +313,14 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
         if partial_affine is None or inliers is None:
             print("  - 无法计算刚性变换矩阵")
             return None, None, None
-        
-        # 手动处理矩阵以确保没有缩放
-        # 提取仿射变换中的旋转部分并强制其为正交矩阵
-        a, b = partial_affine[0, 0], partial_affine[0, 1]
-        c, d = partial_affine[1, 0], partial_affine[1, 1]
-        
-        # 计算缩放因子（忽略，我们将强制为1）
-        # scale = np.sqrt(a*a + b*b)
-        
-        # 计算旋转角度
-        angle = np.arctan2(b, a)
-        
-        # 重建仅包含旋转的矩阵（缩放因子=1）
-        cos_theta = np.cos(angle)
-        sin_theta = np.sin(angle)
-        
-        # 创建纯旋转矩阵（缩放=1）
-        rotation_matrix = np.array([
-            [cos_theta, sin_theta],
-            [-sin_theta, cos_theta]
-        ])
-        
-        # 复制原始平移部分
-        translation = partial_affine[:, 2].reshape(2, 1)
-        
-        # 重建仅含旋转和平移的仿射矩阵
-        corrected_affine = np.hstack((rotation_matrix, translation))
-        
+            
         # 将2x3仿射矩阵转换为3x3的变换矩阵
         H = np.eye(3, dtype=np.float32)
-        H[:2, :] = corrected_affine
+        H[:2, :] = partial_affine
             
         # 计算内点比例
         inlier_ratio = np.sum(inliers) / len(inliers)
         print(f"  - RANSAC内点比例: {inlier_ratio:.2f}")
-        print(f"  - 已强制消除缩放，只保留旋转和平移")
         
         # 如果内点比例太低，可能是错误匹配
         if inlier_ratio < 0.3:
@@ -437,25 +332,12 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
             if partial_affine is None or inliers is None:
                 print("  - 重新计算失败")
                 return None, None, None
-            
-            # 再次应用相同的纠正   
-            a, b = partial_affine[0, 0], partial_affine[0, 1]
-            angle = np.arctan2(b, a)
-            cos_theta = np.cos(angle)
-            sin_theta = np.sin(angle)
-            rotation_matrix = np.array([
-                [cos_theta, sin_theta],
-                [-sin_theta, cos_theta]
-            ])
-            translation = partial_affine[:, 2].reshape(2, 1)
-            corrected_affine = np.hstack((rotation_matrix, translation))
-            
+                
             H = np.eye(3, dtype=np.float32)
-            H[:2, :] = corrected_affine
+            H[:2, :] = partial_affine
             
             inlier_ratio = np.sum(inliers) / len(inliers)
             print(f"  - 重新计算后的内点比例: {inlier_ratio:.2f}")
-            print(f"  - 已强制消除缩放，只保留旋转和平移")
             
             if inlier_ratio < 0.2:
                 print("  - 内点比例仍然过低，拒绝变换")
@@ -468,7 +350,7 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
 
 def warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray) -> np.ndarray:
     """
-    根据变换矩阵将第一张图像变换并与第二张图像融合（仅执行旋转和平移）
+    根据变换矩阵将第一张图像变换并与第二张图像融合
 
     参数:
         img1: 第一张图像
@@ -482,38 +364,30 @@ def warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray) -> np.ndar
     h1, w1 = img1.shape
     h2, w2 = img2.shape
     
-    # 创建仿射变换矩阵
-    affine_matrix = H[:2, :]  # 提取2x3仿射变换部分
+    # 计算变换后的图像尺寸
+    pts = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+    dst = cv2.perspectiveTransform(pts, H)
     
-    # 计算变换后四个角点的坐标
-    corners = np.array([[0, 0], [w1-1, 0], [0, h1-1], [w1-1, h1-1]], dtype=np.float32)
-    transformed_corners = cv2.transform(corners.reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
+    dst_min_x = np.min(dst[:, :, 0])
+    dst_max_x = np.max(dst[:, :, 0])
+    dst_min_y = np.min(dst[:, :, 1])
+    dst_max_y = np.max(dst[:, :, 1])
     
-    # 计算变换后图像的边界
-    min_x = np.floor(np.min(transformed_corners[:, 0])).astype(int)
-    max_x = np.ceil(np.max(transformed_corners[:, 0])).astype(int)
-    min_y = np.floor(np.min(transformed_corners[:, 1])).astype(int)
-    max_y = np.ceil(np.max(transformed_corners[:, 1])).astype(int)
+    # 计算输出图像的尺寸和偏移量
+    offset_x = max(0, -int(dst_min_x))
+    offset_y = max(0, -int(dst_min_y))
     
-    # 计算偏移量
-    offset_x = max(0, -min_x)
-    offset_y = max(0, -min_y)
+    output_width = max(int(dst_max_x) + offset_x, w2 + offset_x)
+    output_height = max(int(dst_max_y) + offset_y, h2 + offset_y)
     
-    # 计算输出图像的尺寸
-    output_width = max(max_x + offset_x, w2 + offset_x)
-    output_height = max(max_y + offset_y, h2 + offset_y)
-    
-    # 创建包含偏移量的仿射变换矩阵 - 修改这部分避免维度不匹配
-    transform_matrix = np.eye(3, dtype=np.float32)  # 创建3x3单位矩阵
+    # 创建变换矩阵，包括偏移量
+    transform_matrix = np.eye(3, dtype=np.float32)
     transform_matrix[0, 2] = offset_x
     transform_matrix[1, 2] = offset_y
     
-    # 组合偏移和原始变换 - 使用3x3矩阵相乘
-    combined_transform = transform_matrix @ H
-    combined_matrix = combined_transform[:2, :]  # 提取用于warpAffine的2x3部分
-    
-    # 使用仿射变换而非透视变换
-    warped_img1 = cv2.warpAffine(img1, combined_matrix, (output_width, output_height))
+    # 变换第一张图像
+    warp_matrix = transform_matrix @ H
+    warped_img1 = cv2.warpPerspective(img1, warp_matrix, (output_width, output_height))
     
     # 创建第二张图像的画布
     merged_img = np.zeros((output_height, output_width), dtype=np.uint8)
@@ -619,7 +493,7 @@ def visualize_matches(img1: np.ndarray, kp1: List[cv2.KeyPoint],
 
 def extract_multi_level_features(img: np.ndarray) -> dict:
     """
-    提取图像的多层次特征，特别针对结构增强
+    提取图像的多层次特征
     
     参数:
         img: 输入图像
@@ -629,67 +503,43 @@ def extract_multi_level_features(img: np.ndarray) -> dict:
     """
     features = {}
     
-    # 基础图像增强
+    # 图像增强
     enhanced_img = enhance_image(img)
     
-    # 结构增强处理
-    structure_img = enhance_structure(img)
-    
-    # 1. 原始ORB特征 - 使用结构增强后的图像
+    # 1. 原始ORB特征
     orb = cv2.ORB_create(
-        nfeatures=5000,        # 增加特征点数量
-        scaleFactor=1.1,       # 减小金字塔层级间的比例因子，检测更多尺度
-        nlevels=10,            # 增加金字塔层级数
-        edgeThreshold=31,      # 边缘阈值
+        nfeatures=3000,
+        scaleFactor=1.2,
+        nlevels=8,
+        edgeThreshold=31,
         firstLevel=0,
-        WTA_K=3,               # 增加用于计算BRIEF描述子的点数
-        patchSize=31,          # 特征点附近的区域大小
-        fastThreshold=20       # 降低FAST检测器阈值，检测更多角点
+        WTA_K=2,
+        patchSize=31
     )
-    
-    # 在结构增强图像上检测特征
-    kp_orb, desc_orb = orb.detectAndCompute(structure_img, None)
+    kp_orb, desc_orb = orb.detectAndCompute(enhanced_img, None)
     features['orb'] = (kp_orb, desc_orb)
     
-    # 2. 边缘特征 - 使用更敏感的参数
-    edges = cv2.Canny(enhanced_img, 30, 150)
+    # 2. 边缘特征
+    edges = cv2.Canny(enhanced_img, 50, 150)
     # 对边缘进行膨胀以增强特征点检测
     kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=2)  # 增加膨胀迭代次数
-    
-    # 在边缘图像上检测特征
+    edges = cv2.dilate(edges, kernel, iterations=1)
     kp_edge, desc_edge = orb.detectAndCompute(edges, None)
     features['edge'] = (kp_edge, desc_edge)
     
     # 3. 形态学处理后的特征
     # 闭运算填充小孔
-    morph_img = cv2.morphologyEx(structure_img, cv2.MORPH_CLOSE, kernel, iterations=2)
+    morph_img = cv2.morphologyEx(enhanced_img, cv2.MORPH_CLOSE, kernel)
     # 开运算去除小物体
     morph_img = cv2.morphologyEx(morph_img, cv2.MORPH_OPEN, kernel)
-    
-    # 在形态学处理图像上检测特征
     kp_morph, desc_morph = orb.detectAndCompute(morph_img, None)
     features['morph'] = (kp_morph, desc_morph)
-    
-    # 4. 新增：LBP纹理特征
-    # 计算LBP (Local Binary Patterns)纹理特征
-    radius = 3
-    n_points = 8 * radius
-    
-    try:
-        lbp = local_binary_pattern(enhanced_img, n_points, radius, method='uniform')
-        lbp = (lbp * 255.0 / lbp.max()).astype(np.uint8)
-        kp_lbp, desc_lbp = orb.detectAndCompute(lbp, None)
-        features['lbp'] = (kp_lbp, desc_lbp)
-    except Exception as e:
-        print(f"  - LBP特征提取失败: {e}")
-        features['lbp'] = ([], None)
     
     return features
 
 def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple[Optional[np.ndarray], List[cv2.KeyPoint], List[cv2.KeyPoint], List[cv2.DMatch], str, Optional[List[cv2.DMatch]], Optional[np.ndarray]]:
     """
-    使用多层次特征进行匹配，优先使用结构增强特征
+    使用多层次特征进行匹配
     
     参数:
         img1: 第一张图像
@@ -702,37 +552,10 @@ def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple
     features1 = extract_multi_level_features(img1)
     features2 = extract_multi_level_features(img2)
     
-    # 特征类型优先级，包括新增的LBP特征
-    feature_types = ['orb', 'edge', 'morph', 'lbp']
+    # 特征类型优先级
+    feature_types = ['orb', 'edge', 'morph']
     
-    # 强制ORB匹配尝试
-    kp1, desc1 = features1['orb']
-    kp2, desc2 = features2['orb']
-    
-    if desc1 is not None and desc2 is not None and len(kp1) >= 4 and len(kp2) >= 4:
-        print(f"  - 尝试使用增强ORB特征强制匹配")
-        print(f"  - 增强ORB特征点数量: {len(kp1)}/{len(kp2)}")
-        
-        # 使用超宽松匹配
-        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-        matches = matcher.match(desc1, desc2)
-        matches = sorted(matches, key=lambda x: x.distance)[:int(len(matches) * 0.6)]  # 只保留60%的最佳匹配
-        
-        print(f"  - 强制匹配后点数: {len(matches)}")
-        
-        # 尝试计算变换矩阵
-        if len(matches) >= 4:
-            H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.9)
-            
-            if H is not None:
-                print(f"  - 使用增强ORB特征强制找到变换矩阵")
-                return H, kp1, kp2, matches, 'orb_enhanced', filtered_matches, inliers
-    
-    # 尝试所有特征类型
     for feature_type in feature_types:
-        if feature_type not in features1 or feature_type not in features2:
-            continue
-            
         kp1, desc1 = features1[feature_type]
         kp2, desc2 = features2[feature_type]
         
@@ -750,21 +573,17 @@ def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple
         # 如果匹配点太少，尝试更宽松的匹配
         if len(matches) < 10:
             print(f"  - 标准匹配点不足({len(matches)}个)，尝试宽松匹配")
-            matches = relaxed_match_features(desc1, desc2, ratio=0.9)
+            matches = relaxed_match_features(desc1, desc2)
             print(f"  - 宽松匹配后点数: {len(matches)}")
-            
-            # 如果仍然不足，尝试直接匹配
-            if len(matches) < 8:
-                print(f"  - 宽松匹配点仍不足，尝试直接匹配")
-                matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
-                matches = matcher.match(desc1, desc2)
-                matches = sorted(matches, key=lambda x: x.distance)[:min(50, len(matches))]
-                print(f"  - 直接匹配后点数: {len(matches)}")
         
         # 如果匹配足够，计算变换矩阵
         if len(matches) >= 4:
-            # 所有特征类型使用宽松参数
-            H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.9)
+            # 对于不同特征类型使用不同的参数
+            if feature_type == 'orb':
+                H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.8)
+            else:
+                # 对其他特征类型使用更宽松的参数
+                H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.9)
                 
             if H is not None:
                 print(f"  - 使用{feature_type}特征找到变换矩阵")
@@ -773,7 +592,7 @@ def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple
     print("  - 所有特征类型都未能找到有效变换矩阵")
     return None, None, None, None, None, None, None
 
-def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 0.9) -> List[cv2.DMatch]:
+def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 0.8) -> List[cv2.DMatch]:
     """
     使用更宽松的参数进行特征匹配
     
@@ -796,7 +615,6 @@ def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 
     for matches in raw_matches:
         # 有时候只能找到一个匹配
         if len(matches) < 2:
-            good_matches.append(matches[0])  # 直接添加唯一匹配
             continue
             
         m, n = matches
@@ -811,7 +629,7 @@ def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 
 
 def adaptive_warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray, blend_weight: float = 0.5) -> np.ndarray:
     """
-    使用自适应权重进行地图融合（仅执行旋转和平移）
+    使用自适应权重进行地图融合
     
     参数:
         img1: 第一张图像
@@ -826,38 +644,30 @@ def adaptive_warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray, b
     h1, w1 = img1.shape
     h2, w2 = img2.shape
     
-    # 创建仿射变换矩阵
-    affine_matrix = H[:2, :]  # 提取2x3仿射变换部分
+    # 计算变换后的图像尺寸
+    pts = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
+    dst = cv2.perspectiveTransform(pts, H)
     
-    # 计算变换后四个角点的坐标
-    corners = np.array([[0, 0], [w1-1, 0], [0, h1-1], [w1-1, h1-1]], dtype=np.float32)
-    transformed_corners = cv2.transform(corners.reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
+    dst_min_x = np.min(dst[:, :, 0])
+    dst_max_x = np.max(dst[:, :, 0])
+    dst_min_y = np.min(dst[:, :, 1])
+    dst_max_y = np.max(dst[:, :, 1])
     
-    # 计算变换后图像的边界
-    min_x = np.floor(np.min(transformed_corners[:, 0])).astype(int)
-    max_x = np.ceil(np.max(transformed_corners[:, 0])).astype(int)
-    min_y = np.floor(np.min(transformed_corners[:, 1])).astype(int)
-    max_y = np.ceil(np.max(transformed_corners[:, 1])).astype(int)
+    # 计算输出图像的尺寸和偏移量
+    offset_x = max(0, -int(dst_min_x))
+    offset_y = max(0, -int(dst_min_y))
     
-    # 计算偏移量
-    offset_x = max(0, -min_x)
-    offset_y = max(0, -min_y)
+    output_width = max(int(dst_max_x) + offset_x, w2 + offset_x)
+    output_height = max(int(dst_max_y) + offset_y, h2 + offset_y)
     
-    # 计算输出图像的尺寸
-    output_width = max(max_x + offset_x, w2 + offset_x)
-    output_height = max(max_y + offset_y, h2 + offset_y)
-    
-    # 创建包含偏移量的仿射变换矩阵 - 修改这部分避免维度不匹配
-    transform_matrix = np.eye(3, dtype=np.float32)  # 创建3x3单位矩阵
+    # 创建变换矩阵，包括偏移量
+    transform_matrix = np.eye(3, dtype=np.float32)
     transform_matrix[0, 2] = offset_x
     transform_matrix[1, 2] = offset_y
     
-    # 组合偏移和原始变换 - 使用3x3矩阵相乘
-    combined_transform = transform_matrix @ H
-    combined_matrix = combined_transform[:2, :]  # 提取用于warpAffine的2x3部分
-    
-    # 使用仿射变换而非透视变换
-    warped_img1 = cv2.warpAffine(img1, combined_matrix, (output_width, output_height))
+    # 变换第一张图像
+    warp_matrix = transform_matrix @ H
+    warped_img1 = cv2.warpPerspective(img1, warp_matrix, (output_width, output_height))
     
     # 创建第二张图像的画布
     merged_img = np.zeros((output_height, output_width), dtype=np.uint8)
