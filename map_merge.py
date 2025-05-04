@@ -425,7 +425,7 @@ def find_rigid_transformation(kp1: List[cv2.KeyPoint], kp2: List[cv2.KeyPoint],
 
 def warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray) -> np.ndarray:
     """
-    根据变换矩阵将第一张图像变换并与第二张图像融合
+    根据变换矩阵将第一张图像变换并与第二张图像融合（仅执行旋转和平移）
 
     参数:
         img1: 第一张图像
@@ -439,30 +439,38 @@ def warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray) -> np.ndar
     h1, w1 = img1.shape
     h2, w2 = img2.shape
     
-    # 计算变换后的图像尺寸
-    pts = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
-    dst = cv2.perspectiveTransform(pts, H)
+    # 创建仿射变换矩阵
+    affine_matrix = H[:2, :]  # 提取2x3仿射变换部分
     
-    dst_min_x = np.min(dst[:, :, 0])
-    dst_max_x = np.max(dst[:, :, 0])
-    dst_min_y = np.min(dst[:, :, 1])
-    dst_max_y = np.max(dst[:, :, 1])
+    # 计算变换后四个角点的坐标
+    corners = np.array([[0, 0], [w1-1, 0], [0, h1-1], [w1-1, h1-1]], dtype=np.float32)
+    transformed_corners = cv2.transform(corners.reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
     
-    # 计算输出图像的尺寸和偏移量
-    offset_x = max(0, -int(dst_min_x))
-    offset_y = max(0, -int(dst_min_y))
+    # 计算变换后图像的边界
+    min_x = np.floor(np.min(transformed_corners[:, 0])).astype(int)
+    max_x = np.ceil(np.max(transformed_corners[:, 0])).astype(int)
+    min_y = np.floor(np.min(transformed_corners[:, 1])).astype(int)
+    max_y = np.ceil(np.max(transformed_corners[:, 1])).astype(int)
     
-    output_width = max(int(dst_max_x) + offset_x, w2 + offset_x)
-    output_height = max(int(dst_max_y) + offset_y, h2 + offset_y)
+    # 计算偏移量
+    offset_x = max(0, -min_x)
+    offset_y = max(0, -min_y)
     
-    # 创建变换矩阵，包括偏移量
-    transform_matrix = np.eye(3, dtype=np.float32)
+    # 计算输出图像的尺寸
+    output_width = max(max_x + offset_x, w2 + offset_x)
+    output_height = max(max_y + offset_y, h2 + offset_y)
+    
+    # 创建包含偏移量的仿射变换矩阵 - 修改这部分避免维度不匹配
+    transform_matrix = np.eye(3, dtype=np.float32)  # 创建3x3单位矩阵
     transform_matrix[0, 2] = offset_x
     transform_matrix[1, 2] = offset_y
     
-    # 变换第一张图像
-    warp_matrix = transform_matrix @ H
-    warped_img1 = cv2.warpPerspective(img1, warp_matrix, (output_width, output_height))
+    # 组合偏移和原始变换 - 使用3x3矩阵相乘
+    combined_transform = transform_matrix @ H
+    combined_matrix = combined_transform[:2, :]  # 提取用于warpAffine的2x3部分
+    
+    # 使用仿射变换而非透视变换
+    warped_img1 = cv2.warpAffine(img1, combined_matrix, (output_width, output_height))
     
     # 创建第二张图像的画布
     merged_img = np.zeros((output_height, output_width), dtype=np.uint8)
@@ -760,7 +768,7 @@ def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 
 
 def adaptive_warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray, blend_weight: float = 0.5) -> np.ndarray:
     """
-    使用自适应权重进行地图融合
+    使用自适应权重进行地图融合（仅执行旋转和平移）
     
     参数:
         img1: 第一张图像
@@ -775,30 +783,38 @@ def adaptive_warp_and_merge(img1: np.ndarray, img2: np.ndarray, H: np.ndarray, b
     h1, w1 = img1.shape
     h2, w2 = img2.shape
     
-    # 计算变换后的图像尺寸
-    pts = np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2)
-    dst = cv2.perspectiveTransform(pts, H)
+    # 创建仿射变换矩阵
+    affine_matrix = H[:2, :]  # 提取2x3仿射变换部分
     
-    dst_min_x = np.min(dst[:, :, 0])
-    dst_max_x = np.max(dst[:, :, 0])
-    dst_min_y = np.min(dst[:, :, 1])
-    dst_max_y = np.max(dst[:, :, 1])
+    # 计算变换后四个角点的坐标
+    corners = np.array([[0, 0], [w1-1, 0], [0, h1-1], [w1-1, h1-1]], dtype=np.float32)
+    transformed_corners = cv2.transform(corners.reshape(1, -1, 2), affine_matrix).reshape(-1, 2)
     
-    # 计算输出图像的尺寸和偏移量
-    offset_x = max(0, -int(dst_min_x))
-    offset_y = max(0, -int(dst_min_y))
+    # 计算变换后图像的边界
+    min_x = np.floor(np.min(transformed_corners[:, 0])).astype(int)
+    max_x = np.ceil(np.max(transformed_corners[:, 0])).astype(int)
+    min_y = np.floor(np.min(transformed_corners[:, 1])).astype(int)
+    max_y = np.ceil(np.max(transformed_corners[:, 1])).astype(int)
     
-    output_width = max(int(dst_max_x) + offset_x, w2 + offset_x)
-    output_height = max(int(dst_max_y) + offset_y, h2 + offset_y)
+    # 计算偏移量
+    offset_x = max(0, -min_x)
+    offset_y = max(0, -min_y)
     
-    # 创建变换矩阵，包括偏移量
-    transform_matrix = np.eye(3, dtype=np.float32)
+    # 计算输出图像的尺寸
+    output_width = max(max_x + offset_x, w2 + offset_x)
+    output_height = max(max_y + offset_y, h2 + offset_y)
+    
+    # 创建包含偏移量的仿射变换矩阵 - 修改这部分避免维度不匹配
+    transform_matrix = np.eye(3, dtype=np.float32)  # 创建3x3单位矩阵
     transform_matrix[0, 2] = offset_x
     transform_matrix[1, 2] = offset_y
     
-    # 变换第一张图像
-    warp_matrix = transform_matrix @ H
-    warped_img1 = cv2.warpPerspective(img1, warp_matrix, (output_width, output_height))
+    # 组合偏移和原始变换 - 使用3x3矩阵相乘
+    combined_transform = transform_matrix @ H
+    combined_matrix = combined_transform[:2, :]  # 提取用于warpAffine的2x3部分
+    
+    # 使用仿射变换而非透视变换
+    warped_img1 = cv2.warpAffine(img1, combined_matrix, (output_width, output_height))
     
     # 创建第二张图像的画布
     merged_img = np.zeros((output_height, output_width), dtype=np.uint8)
