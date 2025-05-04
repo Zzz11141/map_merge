@@ -493,53 +493,60 @@ def visualize_matches(img1: np.ndarray, kp1: List[cv2.KeyPoint],
 
 def extract_multi_level_features(img: np.ndarray) -> dict:
     """
-    提取图像的多层次特征
+    提取图像的多层次特征，但只使用增强的ORB特征
     
     参数:
         img: 输入图像
         
     返回:
-        包含不同特征层次的字典
+        包含ORB特征的字典
     """
     features = {}
     
     # 图像增强
     enhanced_img = enhance_image(img)
     
-    # 1. 原始ORB特征
-    orb = cv2.ORB_create(
-        nfeatures=3000,
-        scaleFactor=1.2,
-        nlevels=8,
-        edgeThreshold=31,
-        firstLevel=0,
-        WTA_K=2,
-        patchSize=31
-    )
-    kp_orb, desc_orb = orb.detectAndCompute(enhanced_img, None)
-    features['orb'] = (kp_orb, desc_orb)
-    
-    # 2. 边缘特征
-    edges = cv2.Canny(enhanced_img, 50, 150)
-    # 对边缘进行膨胀以增强特征点检测
+    # 结构增强处理 - 增加边缘检测以提高特征点质量
+    structure_img = cv2.Canny(enhanced_img, 40, 120)
     kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
-    kp_edge, desc_edge = orb.detectAndCompute(edges, None)
-    features['edge'] = (kp_edge, desc_edge)
+    structure_img = cv2.dilate(structure_img, kernel, iterations=1)
+    structure_img = cv2.add(enhanced_img, cv2.cvtColor(structure_img, cv2.COLOR_GRAY2BGR)[:,:,0])
     
-    # 3. 形态学处理后的特征
-    # 闭运算填充小孔
-    morph_img = cv2.morphologyEx(enhanced_img, cv2.MORPH_CLOSE, kernel)
-    # 开运算去除小物体
-    morph_img = cv2.morphologyEx(morph_img, cv2.MORPH_OPEN, kernel)
-    kp_morph, desc_morph = orb.detectAndCompute(morph_img, None)
-    features['morph'] = (kp_morph, desc_morph)
+    # 创建ORB特征检测器 - 使用更宽松的参数
+    orb = cv2.ORB_create(
+        nfeatures=5000,        # 大幅增加特征点数量
+        scaleFactor=1.1,       # 更小的比例因子，检测更多尺度
+        nlevels=10,            # 增加金字塔层级数
+        edgeThreshold=20,      # 降低边缘阈值，检测更多边缘特征
+        firstLevel=0,
+        WTA_K=2,               # 保持默认BRIEF描述子设置
+        patchSize=31,          # 特征点附近的区域大小
+        fastThreshold=15       # 降低FAST检测器阈值，检测更多角点
+    )
+    
+    # 在增强图像上检测特征
+    kp_orb, desc_orb = orb.detectAndCompute(enhanced_img, None)
+    
+    # 在结构增强图像上检测特征
+    kp_structure, desc_structure = orb.detectAndCompute(structure_img, None)
+    
+    # 合并两组ORB特征点 (如果都有检测到的话)
+    if (kp_orb is not None and len(kp_orb) > 0 and desc_orb is not None and 
+        kp_structure is not None and len(kp_structure) > 0 and desc_structure is not None):
+        # 将两组特征点和描述子合并
+        kp_combined = kp_orb + kp_structure
+        desc_combined = np.vstack((desc_orb, desc_structure))
+        features['orb'] = (kp_combined, desc_combined)
+    elif kp_structure is not None and len(kp_structure) > 0 and desc_structure is not None:
+        features['orb'] = (kp_structure, desc_structure)
+    else:
+        features['orb'] = (kp_orb, desc_orb)
     
     return features
 
 def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple[Optional[np.ndarray], List[cv2.KeyPoint], List[cv2.KeyPoint], List[cv2.DMatch], str, Optional[List[cv2.DMatch]], Optional[np.ndarray]]:
     """
-    使用多层次特征进行匹配
+    只使用ORB特征进行匹配，并使用更宽松的参数
     
     参数:
         img1: 第一张图像
@@ -548,48 +555,97 @@ def match_with_multi_level_features(img1: np.ndarray, img2: np.ndarray) -> Tuple
     返回:
         (变换矩阵, 特征点1, 特征点2, 原始匹配结果, 使用的特征类型, 过滤后的匹配点, RANSAC内点掩码)
     """
-    # 提取多层次特征
+    # 提取ORB特征
     features1 = extract_multi_level_features(img1)
     features2 = extract_multi_level_features(img2)
     
-    # 特征类型优先级
-    feature_types = ['orb', 'edge', 'morph']
+    # 获取ORB特征
+    kp1, desc1 = features1['orb']
+    kp2, desc2 = features2['orb']
     
-    for feature_type in feature_types:
-        kp1, desc1 = features1[feature_type]
-        kp2, desc2 = features2[feature_type]
-        
-        # 跳过无效特征
-        if desc1 is None or desc2 is None or len(kp1) < 4 or len(kp2) < 4:
-            print(f"  - {feature_type}特征无效，跳过")
-            continue
+    # 检查特征点是否有效
+    if desc1 is None or desc2 is None or len(kp1) < 4 or len(kp2) < 4:
+        print(f"  - ORB特征无效，无法进行匹配")
+        return None, None, None, None, None, None, None
             
-        print(f"  - 尝试使用{feature_type}特征进行匹配")
-        print(f"  - {feature_type}特征点数量: {len(kp1)}/{len(kp2)}")
-        
-        # 尝试标准匹配
-        matches = match_features(desc1, desc2)
-        
-        # 如果匹配点太少，尝试更宽松的匹配
-        if len(matches) < 10:
-            print(f"  - 标准匹配点不足({len(matches)}个)，尝试宽松匹配")
-            matches = relaxed_match_features(desc1, desc2)
-            print(f"  - 宽松匹配后点数: {len(matches)}")
-        
-        # 如果匹配足够，计算变换矩阵
-        if len(matches) >= 4:
-            # 对于不同特征类型使用不同的参数
-            if feature_type == 'orb':
-                H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.8)
-            else:
-                # 对其他特征类型使用更宽松的参数
-                H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.9)
-                
-            if H is not None:
-                print(f"  - 使用{feature_type}特征找到变换矩阵")
-                return H, kp1, kp2, matches, feature_type, filtered_matches, inliers
+    print(f"  - 使用ORB特征进行匹配")
+    print(f"  - ORB特征点数量: {len(kp1)}/{len(kp2)}")
     
-    print("  - 所有特征类型都未能找到有效变换矩阵")
+    # 使用宽松的参数进行匹配
+    try:
+        # 1. 首先尝试KNN匹配 + 更宽松的Lowe比率测试 (0.7 -> 0.85)
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        raw_matches = matcher.knnMatch(desc1, desc2, k=2)
+        
+        good_matches = []
+        for matches in raw_matches:
+            if len(matches) < 2:
+                # 如果只有一个匹配，直接添加
+                good_matches.append(matches[0])
+                continue
+                
+            m, n = matches
+            # 使用更宽松的比率
+            if m.distance < 0.85 * n.distance:
+                good_matches.append(m)
+        
+        # 按距离排序
+        matches = sorted(good_matches, key=lambda x: x.distance)
+        print(f"  - KNN匹配后点数: {len(matches)}")
+        
+        # 如果匹配点太少，尝试直接匹配
+        if len(matches) < 10:
+            print(f"  - KNN匹配点不足，尝试直接匹配")
+            matches = matcher.match(desc1, desc2)
+            # 按距离排序并保留70%的最佳匹配
+            matches = sorted(matches, key=lambda x: x.distance)[:int(len(matches) * 0.7)]
+            print(f"  - 直接匹配后点数: {len(matches)}")
+            
+        # 如果找到足够的匹配点，计算变换矩阵（使用更宽松的比例）
+        if len(matches) >= 4:
+            # 使用更宽松的参数
+            H, filtered_matches, inliers = find_rigid_transformation(kp1, kp2, matches, ratio=0.95)
+            
+            if H is not None:
+                print(f"  - 使用ORB特征找到变换矩阵")
+                return H, kp1, kp2, matches, 'orb', filtered_matches, inliers
+                
+        # 如果还是无法找到足够的内点，尝试再次放宽参数
+        if len(matches) >= 4:
+            print(f"  - 尝试使用更宽松的RANSAC参数")
+            # 进一步放宽RANSAC参数，修改find_rigid_transformation中的默认阈值
+            try:
+                # 获取匹配点的坐标
+                src_pts = np.float32([kp1[m.queryIdx].pt for m in matches])
+                dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches])
+                
+                # 使用RANSAC计算刚性变换矩阵（旋转+平移），但使用更宽松的阈值
+                partial_affine, inliers = cv2.estimateAffinePartial2D(
+                    src_pts, dst_pts, method=cv2.RANSAC, ransacReprojThreshold=8.0
+                )
+                
+                if partial_affine is not None and inliers is not None:
+                    # 将2x3仿射矩阵转换为3x3的变换矩阵
+                    H = np.eye(3, dtype=np.float32)
+                    H[:2, :] = partial_affine
+                        
+                    # 计算内点比例
+                    inlier_ratio = np.sum(inliers) / len(inliers)
+                    print(f"  - 宽松RANSAC内点比例: {inlier_ratio:.2f}")
+                    
+                    # 只要有内点，就接受变换
+                    if inlier_ratio > 0.05:  # 极低的内点要求
+                        print(f"  - 使用宽松参数找到变换矩阵")
+                        # 选择good_matches与inliers的部分
+                        filtered_matches = [matches[i] for i in range(len(matches)) if inliers[i]]
+                        return H, kp1, kp2, matches, 'orb', filtered_matches, inliers
+            except Exception as e:
+                print(f"  - 计算宽松变换矩阵时出错: {e}")
+                
+    except Exception as e:
+        print(f"  - ORB特征匹配出错: {e}")
+    
+    print("  - 无法找到有效变换矩阵")
     return None, None, None, None, None, None, None
 
 def relaxed_match_features(desc1: np.ndarray, desc2: np.ndarray, ratio: float = 0.8) -> List[cv2.DMatch]:
